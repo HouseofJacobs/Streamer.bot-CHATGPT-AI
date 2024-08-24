@@ -1,0 +1,1 @@
+This Import is for the Stream.bot application and will allow you to integrate ChatGPT into your Streamer.bot
