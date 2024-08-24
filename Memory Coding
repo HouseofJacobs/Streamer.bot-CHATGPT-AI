@@ -1,0 +1,219 @@
+using System;
+using System.IO;
+using System.Net;
+using System.Text;
+using Newtonsoft.Json;
+using System.Text.RegularExpressions;
+using System.Collections.Generic;
+
+public class CPHInline
+{
+    private static Dictionary<string, List<Message>> conversationHistories;
+
+    public bool Execute()
+    {
+        LoadConversationHistories();
+
+        string apiKey = args["chatGPT3APIkey"].ToString();
+        string model = args["model"].ToString();
+        string content = args["behavior"].ToString();
+        string temperature = args["temperature"].ToString();
+
+        // Create a ChatGPTAPI instance with your API key
+        ChatGPTAPI chatGPT = new ChatGPTAPI(apiKey);
+
+        // Get the message input and user from the arguments
+        string messageInput = args["textInput"].ToString();
+        string user = args["user"].ToString();
+
+        // Retrieve or initialize the conversation history for the user
+        if (!conversationHistories.ContainsKey(user))
+        {
+            conversationHistories[user] = new List<Message>();
+        }
+        var history = conversationHistories[user];
+
+        // Add the user's message to the history
+        history.Add(new Message { role = "user", content = messageInput });
+
+        // Generate a response with the ChatGPTAPI
+        string response = chatGPT.GenerateResponse(history, model, content, temperature);
+
+        // Deserialize the response
+        Root root = JsonConvert.DeserializeObject<Root>(response);
+
+        // Get the assistant's response and add it to the history
+        string assistantResponse = root.choices[0].message.content;
+        history.Add(new Message { role = "assistant", content = assistantResponse });
+
+        // Save the conversation history
+        SaveConversationHistories();
+
+        // Clean the assistant's response for output
+        string cleanedResponse = CleanResponse(assistantResponse);
+
+        // Set the global variable and log the response
+        CPH.SetGlobalVar("GPT", cleanedResponse, false);
+        CPH.LogInfo("GPT " + cleanedResponse);
+        CPH.LogDebug(response);
+
+        return true;
+    }
+
+    private void LoadConversationHistories()
+    {
+        try
+        {
+            string filePath = "conversationHistories.json";
+            if (File.Exists(filePath))
+            {
+                string json = File.ReadAllText(filePath);
+                conversationHistories = JsonConvert.DeserializeObject<Dictionary<string, List<Message>>>(json);
+            }
+            else
+            {
+                conversationHistories = new Dictionary<string, List<Message>>();
+            }
+        }
+        catch (Exception ex)
+        {
+            CPH.LogError("Failed to load conversation histories: " + ex.Message);
+            conversationHistories = new Dictionary<string, List<Message>>();
+        }
+    }
+
+    private void SaveConversationHistories()
+    {
+        try
+        {
+            string filePath = "conversationHistories.json";
+            string json = JsonConvert.SerializeObject(conversationHistories, Formatting.Indented);
+            File.WriteAllText(filePath, json);
+        }
+        catch (Exception ex)
+        {
+            CPH.LogError("Failed to save conversation histories: " + ex.Message);
+        }
+    }
+
+    private string CleanResponse(string response)
+    {
+        string cleaned0 = response.Replace(Environment.NewLine, " ");
+        string cleaned1 = Regex.Replace(cleaned0, @"\r\n?|\n", " ");
+        string cleaned2 = Regex.Replace(cleaned1, @"[\r\n]+", " ");
+        string unescaped = Regex.Unescape(cleaned2);
+        return unescaped.Trim();
+    }
+}
+
+class ChatGPTAPI
+{
+    private string _apiKey;
+    private string _endpoint = "https://api.openai.com/v1/chat/completions";
+    private const int MaxTokens = 4096; // Total token limit
+
+    public ChatGPTAPI(string apiKey)
+    {
+        _apiKey = apiKey;
+    }
+
+    public string GenerateResponse(List<Message> history, string model, string behavior, string temperature)
+    {
+        // Create a request to the ChatGPT API
+        HttpWebRequest request = (HttpWebRequest)WebRequest.Create(_endpoint);
+        request.Headers.Add("Authorization", "Bearer " + _apiKey);
+        request.ContentType = "application/json";
+        request.Method = "POST";
+
+        // Build the request body
+        var messages = new List<Message> { new Message { role = "system", content = behavior } };
+        messages.AddRange(history);
+
+        // Ensure the total tokens are within the limit
+        int totalTokens = GetTokenCount(messages);
+        while (totalTokens > MaxTokens - 100) // Reserve tokens for the response
+        {
+            // Remove the oldest user-assistant message pair
+            if (history.Count > 2)
+            {
+                history.RemoveAt(0); // Remove the oldest user message
+                history.RemoveAt(0); // Remove the oldest assistant message
+            }
+            else
+            {
+                // If there's no more history to remove, break the loop
+                break;
+            }
+            messages = new List<Message> { new Message { role = "system", content = behavior } };
+            messages.AddRange(history);
+            totalTokens = GetTokenCount(messages);
+        }
+
+        string requestBody = JsonConvert.SerializeObject(new
+        {
+            model = model,
+            max_tokens = 100, // Control the length of the response
+            temperature = Convert.ToDouble(temperature),
+            messages = messages
+        });
+        byte[] bytes = Encoding.UTF8.GetBytes(requestBody);
+        request.ContentLength = bytes.Length;
+        using (Stream requestStream = request.GetRequestStream())
+        {
+            requestStream.Write(bytes, 0, bytes.Length);
+        }
+
+        // Get the response from the ChatGPT API
+        HttpWebResponse response = (HttpWebResponse)request.GetResponse();
+        string responseBody;
+        using (Stream responseStream = response.GetResponseStream())
+        {
+            StreamReader reader = new StreamReader(responseStream, Encoding.UTF8);
+            responseBody = reader.ReadToEnd();
+        }
+        return responseBody;
+    }
+
+    private int GetTokenCount(List<Message> messages)
+    {
+        // This is a simplified method to count tokens.
+        // You might want to use a more accurate tokenization approach based on the specific API's tokenization method.
+        int tokenCount = 0;
+        foreach (var message in messages)
+        {
+            tokenCount += message.content.Split(' ').Length; // Simple token estimation
+        }
+        return tokenCount;
+    }
+}
+
+public class Message
+{
+    public string role { get; set; }
+    public string content { get; set; }
+}
+
+public class Choice
+{
+    public Message message { get; set; }
+    public int index { get; set; }
+    public object logprobs { get; set; }
+    public string finish_reason { get; set; }
+}
+
+public class Root
+{
+    public string id { get; set; }
+    public string @object { get; set; }
+    public int created { get; set; }
+    public string model { get; set; }
+    public List<Choice> choices { get; set; }
+    public Usage usage { get; set; }
+}
+
+public class Usage
+{
+    public int prompt_tokens { get; set; }
+    public int completion_tokens { get; set; }
+    public int total_tokens { get; set; }
+}
